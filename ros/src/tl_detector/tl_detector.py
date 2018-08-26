@@ -12,7 +12,17 @@ import cv2
 import yaml
 from scipy.spatial import KDTree
 
+
+# Detector Stuff
+import os
+from cfg import *
+from mobiledet.utils import utils
+from mobiledet.models.keras_yolo import yolo_eval, decode_yolo_output, create_model
+from keras import backend as K
+
 import time
+import tensorflow
+from keras.models import load_model
 
 STATE_COUNT_THRESHOLD = 3
 WAYPOINT_LOOKAHEAD = 100
@@ -49,6 +59,13 @@ class TLDetector(object):
         config_string = rospy.get_param("/traffic_light_config")
         self.config = yaml.load(config_string)
 
+        self.is_site = self.config['is_site']
+
+        #TODO Remove hack to force site mode or ground_truth for testing
+        # self.is_site = True
+        self.ground_truth = False
+
+
         self.upcoming_red_light_pub = rospy.Publisher('/traffic_waypoint', Int32, queue_size=1)
 
         self.bridge = CvBridge()
@@ -60,7 +77,57 @@ class TLDetector(object):
         self.last_wp = -1
         self.state_count = 0
 
-        self.image_counter = 0
+        self.waypoints_2d = None
+        self.waypoint_tree = None
+        self.vgg_model = None
+        self.graph = None
+        self.sess = None
+        self.initialized = False
+
+        if self.is_site:
+            # Detector Stuff
+            self.model_image_size = None
+            model_path = os.path.expanduser('./weights/parking_lot.h5')
+            anchors_path = os.path.expanduser('./model_data/lisa_anchors.txt')
+            classes_path = os.path.expanduser('./model_data/lisa_classes.txt')
+            
+            self.class_names  = utils.get_classes(classes_path)
+ 
+            anchors = utils.get_anchors(anchors_path)
+            if SHALLOW_DETECTOR:
+                anchors = anchors * 2
+                        
+            self.yolo_model, _ = create_model(anchors, self.class_names, load_pretrained=True, 
+            feature_extractor=FEATURE_EXTRACTOR, pretrained_path=model_path, freeze_body=True)
+
+            # Check if model is fully convolutional, assuming channel last order.
+            self.model_image_size = self.yolo_model.layers[0].input_shape[1:3]
+
+            self.sess = K.get_session()  
+
+            # Generate output tensor targets for filtered bounding boxes.
+            self.yolo_outputs = decode_yolo_output(self.yolo_model.output, anchors, len(self.class_names))
+
+            self.input_image_shape = K.placeholder(shape=(2, ))
+            self.boxes, self.scores, self.classes = yolo_eval(
+                self.yolo_outputs,
+                self.input_image_shape,
+                score_threshold=.6,
+                iou_threshold=.6)
+
+            self.graph = tensorflow.get_default_graph()
+        else:
+            try:
+                model_path = os.path.expanduser('./weights/vgg16_1.h5')
+                self.vgg_model = load_model(model_path)
+                self.graph = tensorflow.get_default_graph()
+            except:
+                rospy.logerr(
+                    "Could not load model. Have you downloaded the vgg16_1.h5 file to the weights folder? You can download it here: https://s3-eu-west-1.amazonaws.com/sdcnddata/vgg16_1.h5")
+
+
+        self.initialized = True
+
 
         rospy.spin()
 
@@ -134,17 +201,106 @@ class TLDetector(object):
 
         """
         # For testing, just return the light state:
-        if MOCK_TRAFFIC_LIGHTS:
-            return light.state
-        else:
-            if not self.has_image:
-                self.prev_light_loc = None
-                return False
+        return light.state
+        # if (not self.has_image):
+        #     self.prev_light_loc = None
+        #     return False
+        #
+        # cv_image = self.bridge.imgmsg_to_cv2(self.camera_image, "bgr8")
+        #
+        # # Get classification
+        # return self.light_classifier.get_classification(cv_image)
+
+    def classify_traffic_light(self):
+        """Determine the state of the traffic light in the scene (if any)
+           Using a VGG16 network to classify.
+           https://github.com/FabianHertwig/CarND-Capstone
+
+        Args:
+            None
+
+        Returns:
+            int: ID of traffic light color (specified in styx_msgs/TrafficLight)
+                 UNKNOWN if not found
+
+        """
+        if self.vgg_model and self.initialized and self.camera_image and self.graph:
+            cv_image = self.bridge.imgmsg_to_cv2(self.camera_image, "bgr8")
+            with self.graph.as_default():
+                x = cv2.resize(src=cv_image, dsize=(256, 256))
+                x = x / 255.0
+                x = np.expand_dims(x, 0)
+                predicted_class = self.vgg_model.predict(x)
+                predicted_class = np.argmax(predicted_class)
+                if predicted_class == 0:
+                    return TrafficLight.RED
+                elif predicted_class == 1:
+                    return TrafficLight.YELLOW
+                elif predicted_class == 2:
+                    return TrafficLight.GREEN
+
+        return TrafficLight.UNKNOWN
+
+    def detect_traffic_light(self):
+        """Determine the state of the traffic light in the scene (if any)
+           Using a Yolo_V2 network to detect and classify in a single step.
+           https://github.com/darknight1900/MobileDet
+
+        Args:
+            None
+
 
             cv_image = self.bridge.imgmsg_to_cv2(self.camera_image, "bgr8")
 
-            # Get classification
-            return self.light_classifier.get_classification(cv_image)
+        """
+        # Lisa        styx_msgs/TrafficLight[] (uint8)
+        # stop=0      RED=0
+        # go=1        GREEN=2
+        # warning=2   YELLOW=1
+        # dontcare=3  UNKNOWN=4
+
+        getstate = {"stop" :     TrafficLight.RED,
+                    "warning" :  TrafficLight.YELLOW, 
+                    "go" :       TrafficLight.GREEN, 
+                    "donotcare" : TrafficLight.UNKNOWN }
+
+        predicted_class = "donotcare"
+
+        if self.sess and self.initialized and self.camera_image and self.graph:
+            cv_image = self.bridge.imgmsg_to_cv2(self.camera_image, "bgr8")
+            cv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
+            # resized_image = cv_image.resize(
+            #     tuple(reversed(self.model_image_size)))
+            height, width, channels = cv_image.shape
+            resized_image = cv2.resize(cv_image, tuple(reversed(self.model_image_size)))
+            image_data = np.array(resized_image, dtype='float32')
+            image_data /= 255.
+            image_data = np.expand_dims(image_data, 0)  # Add batch dimension.
+
+            start = time.time()
+            with self.graph.as_default():
+                out_boxes, out_scores, out_classes = self.sess.run(
+                    [self.boxes, self.scores, self.classes],
+                    feed_dict={
+                        self.yolo_model.input: image_data,
+                        self.input_image_shape: [width, height],
+                        K.learning_phase(): 0
+                    })
+            last = (time.time() - start)
+            
+            # print('{}: Found {} boxes'.format(last, len(out_boxes)))
+
+            for i, c in reversed(list(enumerate(out_classes))):
+                predicted_class = self.class_names[c]
+                box = out_boxes[i]
+                score = out_scores[i]
+                label = 'detector: {} {:.2f}'.format(predicted_class, score)
+                print(label)
+            # print(lightstate[predicted_class])
+
+        # Return the state of the class with the highest probability (if any), UNKNOWN otherise
+        return getstate[predicted_class]
+
 
     def process_traffic_lights(self):
         """Finds closest visible traffic light, if one exists, and determines its
@@ -155,10 +311,16 @@ class TLDetector(object):
             int: ID of traffic light color (specified in styx_msgs/TrafficLight)
 
         """
+        
 
-        # List of positions that correspond to the line to stop in front of for a given intersection
-        stop_line_positions = self.config['stop_line_positions']
-        if self.pose:
+        if self.pose and self.waypoints and self.waypoint_tree:
+            closest_light = None
+            line_wp_idx = None
+
+            # List of positions that correspond to the line to stop in front of for a given intersection
+            stop_line_positions = self.config['stop_line_positions']
+
+
             car_position = self.get_closest_waypoint(self.pose.pose.position.x, self.pose.pose.position.y)
         else:
             return -1, TrafficLight.UNKNOWN
@@ -168,37 +330,38 @@ class TLDetector(object):
         if closest_light and distance < WAYPOINT_LOOKAHEAD:
             state = self.get_light_state(closest_light)
 
-            if SAVE_IMAGE:
-                self.save_image(state)
+            diff = len(self.waypoints.waypoints)
+            for i, light in enumerate(self.lights):
+                # Get stop line waypoint index
+                line = stop_line_positions[i]
+                temp_wp_idx = self.get_closest_waypoint(line[0], line[1])
+                distance = temp_wp_idx - car_position
 
-            return line_wp_idx, state
+                if 0 <= distance < diff:
+                    diff = distance
+                    closest_light = light
+                    line_wp_idx = temp_wp_idx
 
-        if SAVE_IMAGE:
-            self.save_image(3)
+            if self.ground_truth:
+                if closest_light:
+                    state = self.get_light_state(closest_light)
+                    return line_wp_idx, state
+            elif self.is_site:
+                state = self.detect_traffic_light()
+                if state != TrafficLight.UNKNOWN:
+                    return line_wp_idx, state
+            else:
+                if not self.pose:
+                    print('xxxxxxxxxxxxxxx')
+                # print(self.pose)
+                # print(self.waypoints)
+                # print(self.waypoint_tree)
+                state = self.classify_traffic_light()
+                if state != TrafficLight.UNKNOWN:
+                    return line_wp_idx, state
 
         return -1, TrafficLight.UNKNOWN
 
-    def get_closest_light_in_front(self, car_position, stop_line_positions):
-        closest_light = None
-        line_wp_idx = None
-        diff = len(self.waypoints.waypoints)
-        for i, light in enumerate(self.lights):
-            # Get stop line waypoint index
-            line = stop_line_positions[i]
-            temp_wp_idx = self.get_closest_waypoint(line[0], line[1])
-            distance = temp_wp_idx - car_position
-
-            if 0 <= distance < diff:
-                diff = distance
-                closest_light = light
-                line_wp_idx = temp_wp_idx
-        return closest_light, diff, line_wp_idx
-
-    def save_image(self, state):
-        path = "/home/student/CarND-Capstone/train_data/{}/{}.png".format(state, time.time())
-        cv_image = self.bridge.imgmsg_to_cv2(self.camera_image, "bgr8")
-        rospy.logwarn("save image " + str(state))
-        cv2.imwrite(path, cv_image)
 
 
 if __name__ == '__main__':
